@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Daily Grid &amp; Billing Report {{ day }}</title>
+<style>
+  :root { --ink:#1d2733; --muted:#5b6b7c; --line:#dfe5ec; --bg:#f6f8fa; --card:#fff; --accent:#2a78d6; --warn:#b86e00; --bad:#b3261e; --ok:#2e7d4f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:#12324f; color:#fff; padding:24px 32px; }
+  header h1 { margin:0 0 4px; font-size:22px; }
+  header p { margin:0; opacity:.8; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:20px 24px; margin-bottom:20px; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px; }
+  .kpi { border:1px solid var(--line); border-radius:6px; padding:12px 14px; }
+  .kpi .v { font-size:22px; font-weight:600; font-variant-numeric: tabular-nums; }
+  .kpi .l { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
+  td.n, th.n { text-align:right; }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit, minmax(420px, 1fr)); gap:16px; }
+  .charts img { width:100%; height:auto; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; background:#eef2f6; }
+  .warn { color:var(--warn); } .bad { color:var(--bad); } .ok { color:var(--ok); }
+  .note { color:var(--muted); font-size:12px; }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart Grid Daily Billing &amp; Solar Contribution Report</h1>
+  <p>Simulated day <strong>{{ day }}</strong> &middot; batch layer (authoritative) &middot; generated {{ generated_at }}</p>
+</header>
+<main>
+
+<section>
+  <h2>Executive summary</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="l">Households billed</div><div class="v">{{ kpis.households }}</div></div>
+    <div class="kpi"><div class="l">Grid consumption</div><div class="v">{{ "{:,.0f}".format(kpis.consumption_kwh) }} kWh</div></div>
+    <div class="kpi"><div class="l">Solar generation</div><div class="v">{{ "{:,.0f}".format(kpis.solar_kwh) }} kWh</div></div>
+    <div class="kpi"><div class="l">Renewable share</div><div class="v">{{ "{:.1%}".format(kpis.renewable_share) }}</div></div>
+    <div class="kpi"><div class="l">Total billed</div><div class="v">{{ currency }} {{ "{:,.0f}".format(kpis.total_billed) }}</div></div>
+    <div class="kpi"><div class="l">Average bill</div><div class="v">{{ currency }} {{ "{:,.2f}".format(kpis.avg_bill) }}</div></div>
+    <div class="kpi"><div class="l">Feed-in credits</div><div class="v">{{ currency }} {{ "{:,.0f}".format(kpis.feed_in_credit) }}</div></div>
+    <div class="kpi"><div class="l">Grid alerts</div><div class="v {{ 'warn' if kpis.alerts else 'ok' }}">{{ kpis.alerts }}</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>Grid load and renewable contribution by zone</h2>
+  <div class="charts">
+    <img alt="Consumption and solar by zone" src="data:image/png;base64,{{ chart_zone }}">
+    <img alt="Renewable share by hour" src="data:image/png;base64,{{ chart_hourly }}">
+  </div>
+  <div class="scroll">
+  <table>
+    <tr><th>Zone</th><th class="n">Households</th><th class="n">Consumption kWh</th><th class="n">Solar kWh</th>
+        <th class="n">Renewable share</th><th class="n">Peak load kW</th><th class="n">Peak hour</th>
+        <th class="n">Cloud cover</th><th class="n">Billed ({{ currency }})</th><th class="n">Avg bill</th></tr>
+    {% for z in zone %}
+    <tr><td>{{ z.grid_zone }}</td><td class="n">{{ z.households }}</td>
+        <td class="n">{{ "{:,.1f}".format(z.consumption_kwh) }}</td><td class="n">{{ "{:,.1f}".format(z.solar_kwh) }}</td>
+        <td class="n {{ 'bad' if z.renewable_share < 0.25 else '' }}">{{ "{:.1%}".format(z.renewable_share) }}</td>
+        <td class="n">{{ "{:,.1f}".format(z.peak_load_kw or 0) }}</td><td class="n">{{ "%02d:00"|format(z.peak_hour or 0) }}</td>
+        <td class="n">{{ "{:.0%}".format(z.cloud_cover) if z.cloud_cover is not none else "n/a" }}</td>
+        <td class="n">{{ "{:,.0f}".format(z.total_billed) }}</td><td class="n">{{ "{:,.2f}".format(z.avg_bill) }}</td></tr>
+    {% endfor %}
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>Household bills</h2>
+  <div class="charts"><img alt="Bill distribution" src="data:image/png;base64,{{ chart_bills }}"></div>
+  <p class="note">Top 15 by amount due. The complete per-household reconciliation is in <code>bills_{{ day }}.csv</code>.</p>
+  <div class="scroll">
+  <table>
+    <tr><th>Household</th><th>Zone</th><th>Plan / tier</th><th class="n">Import kWh</th><th class="n">Peak kWh</th>
+        <th class="n">Export kWh</th><th class="n">Energy</th><th class="n">Block</th><th class="n">Fixed</th>
+        <th class="n">Subsidy</th><th class="n">Feed-in</th><th class="n">Amount due</th><th class="n">Complete</th></tr>
+    {% for b in top_bills %}
+    <tr><td>{{ b.household_id }}</td><td>{{ b.grid_zone }}</td>
+        <td><span class="tag">{{ b.tariff_plan }}</span> <span class="tag">{{ b.billing_tier }}</span>{% if b.subsidy_flag %} <span class="tag">subsidy</span>{% endif %}</td>
+        <td class="n">{{ "{:.2f}".format(b.import_kwh) }}</td><td class="n">{{ "{:.2f}".format(b.peak_import_kwh) }}</td>
+        <td class="n">{{ "{:.2f}".format(b.export_kwh) }}</td><td class="n">{{ "{:,.2f}".format(b.energy_charge) }}</td>
+        <td class="n">{{ "{:,.2f}".format(b.block_surcharge) }}</td><td class="n">{{ "{:,.2f}".format(b.fixed_charge) }}</td>
+        <td class="n">-{{ "{:,.2f}".format(b.subsidy_discount) }}</td><td class="n">-{{ "{:,.2f}".format(b.feed_in_credit) }}</td>
+        <td class="n"><strong>{{ "{:,.2f}".format(b.amount_due) }}</strong></td>
+        <td class="n {{ 'warn' if b.data_completeness < 0.95 else '' }}">{{ "{:.0%}".format(b.data_completeness) }}</td></tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% if credit_bills %}
+  <h2 style="margin-top:20px">Net exporters (solar credit carried forward)</h2>
+  <table>
+    <tr><th>Household</th><th>Zone</th><th class="n">Solar kWh</th><th class="n">Export kWh</th><th class="n">Credit carried ({{ currency }})</th></tr>
+    {% for b in credit_bills %}
+    <tr><td>{{ b.household_id }}</td><td>{{ b.grid_zone }}</td><td class="n">{{ "{:.2f}".format(b.solar_kwh) }}</td>
+        <td class="n">{{ "{:.2f}".format(b.export_kwh) }}</td><td class="n">{{ "{:,.2f}".format(b.carried_credit) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Grid alerts raised by the speed layer</h2>
+  {% if alerts %}
+  <div class="scroll">
+  <table>
+    <tr><th>Window (sim)</th><th>Zone</th><th>Type</th><th>Severity</th><th class="n">Value</th><th class="n">Threshold</th><th>Message</th></tr>
+    {% for a in alerts %}
+    <tr><td>{{ a.window_start.strftime("%H:%M") }}</td><td>{{ a.grid_zone }}</td><td>{{ a.alert_type }}</td>
+        <td class="{{ 'bad' if a.severity == 'critical' else 'warn' }}">{{ a.severity }}</td>
+        <td class="n">{{ "{:.3f}".format(a.metric_value) }}</td><td class="n">{{ "{:.3f}".format(a.threshold) }}</td><td>{{ a.message }}</td></tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}<p class="ok">No grid alerts on this day.</p>{% endif %}
+</section>
+
+<section>
+  <h2>Speed layer vs batch layer reconciliation</h2>
+  <p class="note">The speed layer drops readings that arrive after its event-time watermark (for example meters that were offline and flushed late). The batch layer recomputes from the complete raw archive. The drift shows how much the real-time view under-reported.</p>
+  <table>
+    <tr><th>Zone</th><th class="n">Speed kWh</th><th class="n">Batch kWh</th><th class="n">Drift kWh</th><th class="n">Drift %</th><th class="n">Late readings</th></tr>
+    {% for r in recon %}
+    <tr><td>{{ r.grid_zone }}</td><td class="n">{{ "{:,.2f}".format(r.speed_consumption_kwh) }}</td>
+        <td class="n">{{ "{:,.2f}".format(r.batch_consumption_kwh) }}</td><td class="n">{{ "{:,.2f}".format(r.drift_kwh) }}</td>
+        <td class="n">{{ "{:.2f}%".format(r.drift_pct) if r.drift_pct is not none else "n/a" }}</td><td class="n">{{ r.late_records }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section>
+  <h2>Data quality and lineage</h2>
+  <table>
+    <tr><td>Batch run id</td><td>{{ run.run_id }}</td></tr>
+    <tr><td>Run type</td><td>{{ run.run_type }}</td></tr>
+    <tr><td>Raw records read</td><td>{{ run.raw_records }}</td></tr>
+    <tr><td>Invalid records rejected</td><td>{{ run.invalid_records }} {% if run.invalid_reasons %}<span class="note">{{ run.invalid_reasons }}</span>{% endif %}</td></tr>
+    <tr><td>Duplicates removed</td><td>{{ run.duplicates_removed }}</td></tr>
+    <tr><td>Valid readings billed</td><td>{{ run.valid_records }}</td></tr>
+    <tr><td>Late readings recovered (missed by speed layer)</td><td>{{ run.late_records }}</td></tr>
+    <tr><td>Households with low data completeness (&lt;95%)</td><td>{{ kpis.low_completeness }}</td></tr>
+    <tr><td>Tariff file / version</td><td>{{ tariff.source_file }} (v{{ tariff.tariff_version }}), {{ tariff.carried_forward or 0 }} tariffs carried forward, average rate {{ currency }} {{ "{:.2f}".format(tariff.avg_rate or 0) }}/kWh</td></tr>
+    <tr><td>Batch duration</td><td>{{ run.duration_seconds }} s</td></tr>
+  </table>
+</section>
+
+</main>
+</body>
+</html>
