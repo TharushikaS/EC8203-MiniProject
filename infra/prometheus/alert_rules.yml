@@ -1,0 +1,108 @@
+# Alert rules. Real-time thresholds are expressed in REAL seconds; remember that with the
+# default clock 1 real minute = 4.8 simulated hours, so "for: 1m" is already a long outage.
+groups:
+  - name: pipeline-health
+    rules:
+      - alert: MeterStreamNoData
+        # "or vector(0)": when the producer is down its series vanish, which must still count as 0
+        expr: (sum(rate(smartgrid_producer_events_sent_total[1m])) or vector(0)) == 0
+        for: 1m
+        labels: { severity: critical, stage: ingestion }
+        annotations:
+          summary: "No meter readings produced to Kafka for over 1 minute (~5 simulated hours)"
+
+      - alert: SpeedLayerNoInput
+        expr: (sum(rate(smartgrid_stream_input_rows_total{query="grid_state"}[1m])) or vector(0)) == 0
+        for: 1m
+        labels: { severity: critical, stage: processing }
+        annotations:
+          summary: "Speed layer received no rows from Kafka for over 1 minute"
+
+      - alert: ScrapeTargetDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }} metrics endpoint is down"
+
+      - alert: ProducerDeliveryErrors
+        expr: rate(smartgrid_producer_delivery_errors_total[2m]) > 0
+        for: 30s
+        labels: { severity: warning, stage: ingestion }
+        annotations:
+          summary: "Kafka is rejecting meter readings ({{ $value | humanize }}/s)"
+
+      - alert: StreamingLagHigh
+        expr: max(smartgrid_stream_kafka_lag_records) > 5000
+        for: 1m
+        labels: { severity: warning, stage: processing }
+        annotations:
+          summary: "Speed layer is {{ $value }} records behind the head of meter-readings"
+
+      - alert: InvalidRecordRateHigh
+        expr: |
+          sum(rate(smartgrid_stream_records_total{status="invalid"}[2m]))
+            / sum(rate(smartgrid_stream_records_total[2m])) > 0.05
+        for: 1m
+        labels: { severity: warning, stage: processing }
+        annotations:
+          summary: "More than 5% of meter readings are failing validation ({{ $value | humanizePercentage }})"
+
+      - alert: StreamSinkErrors
+        expr: increase(smartgrid_stream_sink_errors_total[2m]) > 0
+        labels: { severity: critical, stage: storage }
+        annotations:
+          summary: "Speed layer failed to write {{ $labels.table }} to the serving store"
+
+      - alert: SpeedViewStale
+        expr: smartgrid_speed_view_age_seconds > 90
+        for: 30s
+        labels: { severity: critical, stage: serving }
+        annotations:
+          summary: "Real-time zone view not updated for {{ $value | humanizeDuration }}"
+
+      - alert: EndToEndLatencyHigh
+        # raw_ingest triggers every 20 s, so ~25 s is the normal ceiling; 60 s means a real backlog
+        expr: histogram_quantile(0.95, sum(rate(smartgrid_stream_e2e_latency_seconds_bucket[5m])) by (le)) > 60
+        for: 2m
+        labels: { severity: warning, stage: processing }
+        annotations:
+          summary: "p95 producer->speed-layer latency is {{ $value | humanize }}s"
+
+  - name: batch-layer
+    rules:
+      - alert: TariffFeedLate
+        # 1 simulated day = 300 real s by default; flag when no drop for > 2 simulated days
+        expr: time() - smartgrid_tariff_last_drop_unixtime > 600
+        for: 30s
+        labels: { severity: warning, stage: ingestion }
+        annotations:
+          summary: "Daily tariff feed has not landed for {{ $value | humanizeDuration }}"
+
+      - alert: BatchJobFailed
+        expr: smartgrid_batch_last_status == 0
+        labels: { severity: critical, stage: batch }
+        annotations:
+          summary: "Last batch run of {{ $labels.dag }} failed - see Airflow logs"
+
+      - alert: BatchViewStale
+        expr: smartgrid_batch_view_lag_days > 2
+        for: 1m
+        labels: { severity: warning, stage: batch }
+        annotations:
+          summary: "Latest confirmed bills are {{ $value }} simulated days old"
+
+      - alert: SpeedBatchDriftHigh
+        expr: smartgrid_batch_last_max_zone_drift_pct > 10
+        labels: { severity: info, stage: batch }
+        annotations:
+          summary: "Speed layer under-reported a zone by {{ $value | humanize }}% (late data) - batch corrected it"
+
+  - name: business
+    rules:
+      - alert: LowRenewableContribution
+        expr: (smartgrid_zone_renewable_share < 0.25) and on() (smartgrid_sim_hour >= 9 and smartgrid_sim_hour < 16)
+        for: 20s
+        labels: { severity: warning, stage: business }
+        annotations:
+          summary: "Renewable contribution in {{ $labels.zone }} is {{ $value | humanizePercentage }} during daylight"

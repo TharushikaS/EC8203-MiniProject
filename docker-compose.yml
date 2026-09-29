@@ -1,0 +1,339 @@
+# SmartGrid Lambda platform - one command brings up the whole pipeline:
+#     docker compose up -d --build
+# Service map (host ports):
+#   API 8000 | Airflow 8080 | Grafana 3000 | Prometheus 9090 | Alertmanager 9093
+#   Pushgateway 9091 | Spark UI 4040 | Kafka (host clients) 29092 | Postgres 5433
+#   Kafka UI 8085 (optional: --profile tools)
+
+x-pipeline-env: &pipeline-env
+  TZ: UTC
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  TOPIC_METER_READINGS: meter-readings
+  TOPIC_DLQ: meter-readings-dlq
+  TOPIC_ALERTS: grid-alerts
+  SIM_START: ${SIM_START:-2026-03-01T00:00:00+00:00}
+  SIM_DAY_SECONDS: ${SIM_DAY_SECONDS:-300}
+  INTERVAL_MINUTES: ${INTERVAL_MINUTES:-15}
+  NUM_HOUSEHOLDS: ${NUM_HOUSEHOLDS:-250}
+  RANDOM_SEED: ${RANDOM_SEED:-42}
+  DUPLICATE_RATE: ${DUPLICATE_RATE:-0.01}
+  INVALID_RATE: ${INVALID_RATE:-0.005}
+  OUTAGE_RATE: ${OUTAGE_RATE:-0.0012}
+  TARIFF_BAD_ROW_RATE: ${TARIFF_BAD_ROW_RATE:-0.01}
+  TARIFF_LATE_PROBABILITY: ${TARIFF_LATE_PROBABILITY:-0.15}
+  WATERMARK_SIM_MINUTES: ${WATERMARK_SIM_MINUTES:-120}
+  LOW_RENEWABLE_THRESHOLD: ${LOW_RENEWABLE_THRESHOLD:-0.25}
+  DATA_DIR: /data
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: smartgrid
+  POSTGRES_USER: smartgrid
+  POSTGRES_PASSWORD: ${SMARTGRID_DB_PASSWORD:-smartgrid}
+  PUSHGATEWAY_URL: pushgateway:9091
+  CURRENCY: LKR
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  STREAM_TRIGGER_SECONDS: ${STREAM_TRIGGER_SECONDS:-10}
+  ARCHIVE_TRIGGER_SECONDS: ${ARCHIVE_TRIGGER_SECONDS:-20}
+
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "3" }
+
+services:
+  # ------------------------------------------------------------------ storage
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d smartgrid"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 512m
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Shared volume permissions (Spark runs as root, Airflow as uid 50000).
+  volume-init:
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /data/state /data/lake /data/landing /data/checkpoints /data/output && chmod -R 0777 /data"]
+    volumes:
+      - smartgrid-data:/data
+
+  # ------------------------------------------------------------------ ingestion
+  kafka:
+    image: apache/kafka:3.8.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"   # KRaft cluster id (base64 UUID)
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports: ["29092:29092"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    mem_limit: 1g
+    logging: *default-logging
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:3.8.1
+    depends_on:
+      kafka: { condition: service_healthy }
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["bash", "/create-topics.sh"]
+    restart: "no"
+
+  meter-simulator:
+    build: { context: ., dockerfile: docker/app/Dockerfile }
+    image: smartgrid-app:latest
+    command: ["python", "-m", "smartgrid.simulators.meter_stream"]
+    environment: *pipeline-env
+    volumes:
+      - smartgrid-data:/data
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      volume-init: { condition: service_completed_successfully }
+    mem_limit: 256m
+    logging: *default-logging
+    restart: unless-stopped
+
+  tariff-simulator:
+    image: smartgrid-app:latest
+    command: ["python", "-m", "smartgrid.simulators.daily_tariff_drop"]
+    environment: *pipeline-env
+    volumes:
+      - smartgrid-data:/data
+    depends_on:
+      meter-simulator: { condition: service_started }
+    mem_limit: 192m
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ speed layer
+  spark-streaming:
+    build: { context: ., dockerfile: docker/spark/Dockerfile }
+    image: smartgrid-spark:latest
+    environment: *pipeline-env
+    volumes:
+      - smartgrid-data:/data
+    ports: ["4040:4040"]
+    command: ["/opt/spark/bin/spark-submit", "--master", "local[4]", "--driver-memory", "1536m",
+              "/opt/smartgrid/src/smartgrid/speed/streaming_job.py"]
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+      volume-init: { condition: service_completed_successfully }
+    mem_limit: 2304m
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ batch layer (orchestration)
+  airflow-init:
+    build: { context: ., dockerfile: docker/airflow/Dockerfile }
+    image: smartgrid-airflow:latest
+    command:
+      - bash
+      - -c
+      - >-
+        airflow db migrate &&
+        airflow users create --username "$${AIRFLOW_ADMIN_USER}" --password "$${AIRFLOW_ADMIN_PASSWORD}"
+        --firstname Smart --lastname Grid --role Admin --email admin@example.com || true
+    environment: &airflow-env
+      <<: *pipeline-env
+      OUTPUT_DIR: /data/output
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__PARALLELISM: "4"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "60"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "60"
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL: "3600"
+      AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "300"
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-smartgrid-local-dev-secret}
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      SPARK_MASTER: local[2]
+      SPARK_DRIVER_MEMORY: 1g
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  # Scheduler + LocalExecutor: runs the DAG tasks, including the Spark batch job (spark-submit).
+  airflow-scheduler:
+    image: smartgrid-airflow:latest
+    command: ["scheduler"]
+    environment: *airflow-env
+    volumes: &airflow-volumes
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - smartgrid-data:/data
+      - ./output:/data/output
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+      volume-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8974/health >/dev/null"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    mem_limit: 2560m
+    logging: *default-logging
+    restart: unless-stopped
+
+  airflow-webserver:
+    image: smartgrid-airflow:latest
+    command: ["webserver"]
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    ports: ["8080:8080"]
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/health >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    mem_limit: 1g
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ serving layer
+  api:
+    image: smartgrid-app:latest
+    command: ["uvicorn", "smartgrid.serving.api:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      <<: *pipeline-env
+      OUTPUT_DIR: /data/output
+    volumes:
+      - smartgrid-data:/data
+      - ./output:/data/output:ro
+    ports: ["8000:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      meter-simulator: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/api/v1/billing/days',timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ observability
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    command: ["--kafka.server=kafka:9092"]
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    mem_limit: 128m
+    restart: unless-stopped
+
+  pushgateway:
+    image: prom/pushgateway:v1.10.0
+    ports: ["9091:9091"]
+    mem_limit: 64m
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    mem_limit: 384m
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ./infra/alertmanager:/etc/alertmanager:ro
+    ports: ["9093:9093"]
+    mem_limit: 64m
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: light
+      GF_AUTH_ANONYMOUS_ENABLED: "true"        # read-only dashboards without login (local demo)
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/smartgrid-live-ops.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [postgres, prometheus]
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ optional tools
+  kafka-ui:
+    profiles: ["tools"]
+    image: kafbat/kafka-ui:v1.1.0
+    environment:
+      KAFKA_CLUSTERS_0_NAME: smartgrid
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports: ["8085:8080"]
+    depends_on: [kafka]
+    mem_limit: 384m
+
+  tests:
+    profiles: ["test"]
+    image: smartgrid-airflow:latest
+    entrypoint: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/opt/smartgrid/tests"]
+    environment:
+      TZ: UTC
+      DATA_DIR: /tmp/smartgrid-test
+    volumes:
+      - ./tests:/opt/smartgrid/tests:ro
+      - ./src:/opt/smartgrid/src:ro
+
+volumes:
+  pg-data:
+  kafka-data:
+  smartgrid-data:
+  prometheus-data:
+  grafana-data:

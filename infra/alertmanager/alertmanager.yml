@@ -1,0 +1,15 @@
+# Every alert is delivered to the serving API webhook, which logs it (structured JSON) and
+# stores it in ops_alerts so it appears in Grafana and /api/v1/pipeline/status.
+# In production this receiver would be Slack / PagerDuty / e-mail.
+route:
+  receiver: smartgrid-api
+  group_by: ["alertname", "zone"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 10m
+
+receivers:
+  - name: smartgrid-api
+    webhook_configs:
+      - url: http://api:8080/api/v1/ops/alertmanager
+        send_resolved: true

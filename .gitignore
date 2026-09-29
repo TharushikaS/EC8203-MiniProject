@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+*.log
+output/reports/*
+!output/reports/.gitkeep
+.idea/
+.vscode/
+.DS_Store
+spark-warehouse/
+metastore_db/
+derby.log
