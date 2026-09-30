@@ -86,7 +86,12 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_NUM_PARTITIONS: 6
       KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data     # must match the volume, the image default is /tmp
       KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      # Tolerate CPU stalls / laptop sleep: the default 9 s KRaft session timeout fences the
+      # broker from its own controller on a busy 4-core host, leaving partitions leaderless.
+      KAFKA_BROKER_SESSION_TIMEOUT_MS: 30000
+      KAFKA_BROKER_HEARTBEAT_INTERVAL_MS: 3000
       CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"   # KRaft cluster id (base64 UUID)
     volumes:
       - kafka-data:/var/lib/kafka/data

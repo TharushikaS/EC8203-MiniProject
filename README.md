@@ -118,6 +118,10 @@ docker compose down          # stop (keeps data; the simulated clock keeps runni
 docker compose down -v       # full reset: deletes Kafka, lake, Postgres volumes and restarts the clock
 ```
 
+> **Laptop sleep / long pauses:** the simulated clock follows real time, so if the machine sleeps for
+> 8 hours the simulation jumps about 96 simulated days ahead, leaving a gap with no data. Before a demo,
+> disable sleep, or run `docker compose down -v && docker compose up -d` about 15 minutes beforehand.
+
 ## Serving API
 
 | Endpoint | Layer | Answers |
