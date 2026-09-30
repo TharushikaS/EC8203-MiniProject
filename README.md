@@ -143,11 +143,9 @@ docker compose down -v       # full reset: deletes Kafka, lake, Postgres volumes
 # 1. Late data: the speed layer drops readings older than its watermark, the batch layer recovers them
 curl -s localhost:8000/api/v1/billing/2026-03-01/reconciliation | python -m json.tool
 
-# 2. Recompute: the billing system re-issues a corrected tariff (+10%) for a past day ...
-docker compose exec airflow-scheduler python /opt/smartgrid/scripts/issue_tariff_correction.py 2026-03-01 --pct 10
-# ... and the batch layer regenerates that day's bills and report from the immutable raw archive
-docker compose exec airflow-scheduler airflow dags trigger smartgrid_recompute \
-  -c '{"start_date": "2026-03-01", "end_date": "2026-03-01", "reason": "tariff correction v2"}'
+# 2. Recompute: the billing system re-issues a corrected tariff (+10%) for a past day, and the
+#    batch layer regenerates that day's bills and report from the immutable raw archive
+docker compose exec airflow-scheduler python /opt/smartgrid/scripts/issue_tariff_correction.py 2026-03-01 --pct 10 --recompute
 
 # 3. Failure detection: stop the meter feed and watch MeterStreamNoData / SpeedViewStale fire
 docker compose stop meter-simulator   # then: http://localhost:9090/alerts ; restart with: docker compose start meter-simulator

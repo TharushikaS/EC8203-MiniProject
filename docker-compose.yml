@@ -201,6 +201,7 @@ services:
     environment: *airflow-env
     volumes: &airflow-volumes
       - ./airflow/dags:/opt/airflow/dags:ro
+      - ./scripts:/opt/smartgrid/scripts:ro
       - smartgrid-data:/data
       - ./output:/data/output
     depends_on:
