@@ -106,7 +106,7 @@ docker compose stop meter-simulator
 docker compose start meter-simulator
 ```
 
-The same commands work unchanged in PowerShell 5/7, cmd and Git Bash.
+The same commands work unchanged in PowerShell 5/7, cmd and Git Bash. (In the PDF version, long commands are wrapped with a trailing backtick character, which is PowerShell's line continuation; in cmd or bash, type them on one line.)
 
 ## 5. Screenshots to capture for the report
 
